@@ -21,11 +21,11 @@
     },
     "autoload": {
         "psr-4": {
-            "Sigstore\\": "src/",
-            "Dev\\Sigstore\\": "src/Proto/Dev/Sigstore/",
-            "Google\\Api\\": "src/Proto/Google/Api/",
-            "GPBMetadata\\": "src/Proto/GPBMetadata/"
-        }
+            "Sigstore\\": "src/"
+        },
+        "classmap": [
+            "bin/"
+        ]
     },
     "require-dev": {
         "phpunit/phpunit": "^10.0 || ^11.0"
