@@ -1,0 +1,27 @@
+FROM debian:trixie-slim
+
+# Install prerequisites
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    git \
+    php-cli \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install protoc
+ARG PROTOC_VERSION=26.1
+RUN curl -L -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip \
+    && unzip /tmp/protoc.zip -d /usr/local \
+    && rm /tmp/protoc.zip
+
+WORKDIR /workspace
+
+# Clone repositories
+RUN git clone --depth 1 https://github.com/sigstore/protobuf-specs.git ./sigstore-protobuf-specs
+RUN git clone --depth 1 https://github.com/googleapis/googleapis.git ./googleapis
+
+COPY generate.sh /generate.sh
+RUN chmod +x /generate.sh
+
+ENTRYPOINT ["/generate.sh"]
