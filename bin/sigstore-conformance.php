@@ -9,6 +9,7 @@ use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
+use Sigstore\Verifier;
 
 class SignBundleCommand extends Command
 {
@@ -78,7 +79,26 @@ class VerifyBundleCommand extends Command
              $output->writeln('<error>Must provide either certificate identity/issuer or a key.</error>');
              return Command::INVALID;
         }
-        // TODO: Implement verification logic
+                $verifier = new \Sigstore\Verifier();
+
+        try {
+            if ($input->getOption('bundle')) {
+                $bundle = $verifier->loadBundle($input->getOption('bundle'));
+                $output->writeln('<info>Bundle loaded successfully.</info>');
+                // TODO: Use the bundle
+            }
+
+            if ($input->getOption('trusted-root')) {
+                $trustedRoot = $verifier->loadTrustedRoot($input->getOption('trusted-root'));
+                $output->writeln('<info>Trusted root loaded successfully.</info>');
+                // TODO: Use the trusted root
+            }
+        } catch (\Exception $e) {
+            $output->writeln('<error>Error loading inputs: ' . $e->getMessage() . '</error>');
+            return Command::FAILURE;
+        }
+
+        // TODO: Implement full verification logic
 
         return Command::SUCCESS;
     }
