@@ -1,0 +1,47 @@
+name: Conformance Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-versions: ['8.4', '8.5']
+    name: PHP ${{ matrix.php-versions }} Conformance
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-versions }}
+          extensions: openssl, json, dom, xml
+          tools: composer
+
+      - name: Install Composer dependencies
+        run: composer install --no-progress --no-interaction
+
+      - name: Run Sigstore Conformance Tests (Production)
+        uses: sigstore/sigstore-conformance@v0.0.26
+        with:
+          entrypoint: ${{ github.workspace }}/bin/sigstore-conformance.php
+          # xfail: "" # Add expected failures here as tests are implemented
+
+      - name: Run Sigstore Conformance Tests (Staging)
+        uses: sigstore/sigstore-conformance@v0.0.26
+        with:
+          entrypoint: ${{ github.workspace }}/bin/sigstore-conformance.php
+          environment: staging
+          # xfail: "" # Add expected failures here as tests are implemented
