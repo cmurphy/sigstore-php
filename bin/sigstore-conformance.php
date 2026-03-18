@@ -82,25 +82,36 @@ class VerifyBundleCommand extends Command
                 $verifier = new \Sigstore\Verifier();
 
         try {
-            if ($input->getOption('bundle')) {
-                $bundle = $verifier->loadBundle($input->getOption('bundle'));
-                $output->writeln('<info>Bundle loaded successfully.</info>');
-                // TODO: Use the bundle
+            if (!$input->getOption('bundle')) {
+                 $output->writeln('<error>--bundle option is required.</error>');
+                 return Command::FAILURE;
             }
+            $bundle = $verifier->loadBundle($input->getOption('bundle'));
+            $output->writeln('<info>Bundle loaded and validated successfully.</info>');
 
+            $trustedRoot = null;
             if ($input->getOption('trusted-root')) {
                 $trustedRoot = $verifier->loadTrustedRoot($input->getOption('trusted-root'));
                 $output->writeln('<info>Trusted root loaded successfully.</info>');
-                // TODO: Use the trusted root
+            } else {
+                // TODO: Implement TUF client to fetch default trusted root
+                $output->writeln('<comment>--trusted-root not provided, will need to fetch from TUF (not implemented).</comment>');
             }
+
+            $artifactPathOrDigest = $input->getArgument('file_or_digest');
+
+            // TODO: Pass other options like identity, issuer, key path
+            if ($verifier->verify($bundle, $trustedRoot, $artifactPathOrDigest)) {
+                return Command::SUCCESS;
+            } else {
+                $output->writeln('<error>Verification failed.</error>');
+                return Command::FAILURE;
+            }
+
         } catch (\Exception $e) {
-            $output->writeln('<error>Error loading inputs: ' . $e->getMessage() . '</error>');
+            $output->writeln('<error>Verification failed: ' . $e->getMessage() . '</error>');
             return Command::FAILURE;
         }
-
-        // TODO: Implement full verification logic
-
-        return Command::SUCCESS;
     }
 }
 
