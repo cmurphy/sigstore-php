@@ -99,9 +99,11 @@ class VerifyBundleCommand extends Command
             }
 
             $artifactPathOrDigest = $input->getArgument('file_or_digest');
+            $publicKeyPath = $input->getOption('key');
+            $expectedCertIdentity = $input->getOption('certificate-identity');
+            $expectedCertIssuer = $input->getOption('certificate-oidc-issuer');
 
-            // TODO: Pass other options like identity, issuer, key path
-            if ($verifier->verify($bundle, $trustedRoot, $artifactPathOrDigest)) {
+            if ($verifier->verify($bundle, $trustedRoot, $artifactPathOrDigest, $publicKeyPath, $expectedCertIdentity, $expectedCertIssuer)) {
                 return Command::SUCCESS;
             } else {
                 $output->writeln('<error>Verification failed.</error>');

@@ -7,6 +7,10 @@ use Dev\Sigstore\Trustroot\V1\TrustedRoot;
 use Google\Protobuf\Internal\Message;
 use Io\Intoto\Envelope;
 use Io\Intoto\Signature;
+use Dev\Sigstore\Bundle\V1\VerificationMaterial;
+use Dev\Sigstore\Common\V1\HashAlgorithm;
+use phpseclib3\Crypt\EC;
+use phpseclib3\Crypt\PublicKeyLoader;
 
 class Verifier
 {
@@ -142,9 +146,193 @@ class Verifier
         return $result;
     }
 
-    public function verify(Bundle $bundle, ?TrustedRoot $trustedRoot, string $artifactPathOrDigest): bool
+    public function verify(
+        Bundle $bundle,
+        ?TrustedRoot $trustedRoot,
+        string $artifactPathOrDigest,
+        ?string $publicKeyPath = null,
+        ?string $expectedCertIdentity = null,
+        ?string $expectedCertIssuer = null
+    ): bool {
+        // 1. Get artifact digest
+        try {
+            $artifactDigest = $this->getArtifactDigest($artifactPathOrDigest);
+        } catch (\Exception $e) {
+            throw new \RuntimeException("Failed to get artifact digest: " . $e->getMessage(), 0, $e);
+        }
+
+        $verificationMaterial = $bundle->getVerificationMaterial();
+        if ($verificationMaterial === null) {
+            throw new \RuntimeException("Bundle missing verification material");
+        }
+
+        if ($publicKeyPath) {
+            // 2a. Verify using provided public key
+            if (!file_exists($publicKeyPath)) {
+                throw new \InvalidArgumentException("Public key file not found: {$publicKeyPath}");
+            }
+            $publicKeyPem = file_get_contents($publicKeyPath);
+            return $this->verifyWithPublicKey($bundle, $publicKeyPem, $artifactDigest);
+        } elseif ($expectedCertIdentity && $expectedCertIssuer) {
+            // 2b. Verify using certificate chain and trusted root
+            if (!$trustedRoot) {
+                 throw new \InvalidArgumentException("Trusted root is required for certificate-based verification");
+            }
+            return $this->verifyWithCertificate($bundle, $trustedRoot, $artifactDigest, $expectedCertIdentity, $expectedCertIssuer);
+        } else {
+            // Should not happen due to checks in CLI
+            throw new \InvalidArgumentException("Insufficient options for verification");
+        }
+    }
+
+    private function verifyWithPublicKey(Bundle $bundle, string $publicKeyPem, string $artifactDigest): bool
     {
-        // TODO: Implement full verification logic
-        return true;
+        try {
+            /** @var \phpseclib3\Crypt\EC\PublicKey $publicKey */
+            $publicKey = PublicKeyLoader::load($publicKeyPem);
+        } catch (\Exception $e) {
+            throw new \RuntimeException("Failed to load public key: " . $e->getMessage(), 0, $e);
+        }
+
+        if (!($publicKey instanceof EC)) {
+             throw new \RuntimeException("Only EC keys are currently supported");
+        }
+
+        $signature = '';
+        $hashAlgo = 'sha256';
+
+        if ($bundle->hasMessageSignature()) {
+            $msgSig = $bundle->getMessageSignature();
+            $signature = $msgSig->getSignature();
+            if (empty($signature)) throw new \RuntimeException("Bundle message signature is empty");
+
+            $messageDigest = $msgSig->getMessageDigest();
+            if (!$messageDigest || $messageDigest->getAlgorithm() !== HashAlgorithm::SHA2_256) {
+                throw new \RuntimeException("Only SHA256 message digest is supported");
+            }
+            if ($messageDigest->getDigest() !== hex2bin($artifactDigest)) {
+                 throw new \RuntimeException("Artifact digest does not match message digest in bundle");
+            }
+            $dataHashed = $messageDigest->getDigest(); // This is the raw digest
+
+            if ($this->verifyPrecomputedHash($publicKey, $dataHashed, $signature)) {
+                 return true;
+            } else {
+                 throw new \RuntimeException("Signature verification failed for MessageSignature with precomputed hash");
+            }
+
+        } elseif ($bundle->hasDsseEnvelope()) {
+            $envelope = $bundle->getDsseEnvelope();
+            if (count($envelope->getSignatures()) === 0) throw new \RuntimeException("DSSE envelope has no signatures");
+            $signature = $envelope->getSignatures()[0]->getSig();
+            if (empty($signature)) throw new \RuntimeException("DSSE signature is empty");
+
+            $payloadType = $envelope->getPayloadType();
+            $payload = $envelope->getPayload();
+            $paeData = sprintf(
+                "DSSEv1 %d %s %d %s",
+                strlen($payloadType), $payloadType,
+                strlen($payload), $payload
+            );
+            
+            $publicKey = $publicKey->withHash($hashAlgo);
+
+            if ($publicKey->verify($paeData, $signature)) {
+                return true;
+            } else {
+                 throw new \RuntimeException("Signature verification failed for DSSE Envelope");
+            }
+        } else {
+            throw new \RuntimeException("Bundle has no supported content");
+        }
+    }
+
+    private function verifyWithCertificate(Bundle $bundle, TrustedRoot $trustedRoot, string $artifactDigest, string $expectedIdentity, string $expectedIssuer): bool
+    {
+        // TODO: Implement certificate chain verification against trusted root
+        // TODO: Implement certificate identity and issuer check
+        // TODO: Extract signature from bundle
+        // TODO: Prepare payload/data that was signed
+        // TODO: Perform signature verification using cert's public key
+        throw new \RuntimeException("verifyWithCertificate not implemented");
+    }
+
+    private function verifyPrecomputedHash(EC\PublicKey $key, string $hashBytes, string $signature): bool
+    {
+        $params = \phpseclib3\Crypt\EC\Formats\Signature\ASN1::load($signature);
+        if ($params === false || count($params) != 2) {
+            return false;
+        }
+        $r = $params['r'];
+        $s = $params['s'];
+
+        $refClass = new \ReflectionClass($key);
+        $curveProp = $refClass->getProperty('curve');
+        $curveProp->setAccessible(true);
+        $curve = $curveProp->getValue($key);
+
+        $qaProp = $refClass->getProperty('QA');
+        $qaProp->setAccessible(true);
+        $QA = $qaProp->getValue($key);
+
+        $order = $curve->getOrder();
+        $one = new \phpseclib3\Math\BigInteger(1);
+        $n_1 = $order->subtract($one);
+
+        if (!$r->between($one, $n_1) || !$s->between($one, $n_1)) {
+            return false;
+        }
+
+        $e = new \phpseclib3\Math\BigInteger($hashBytes, 256);
+        $z = $e; 
+
+        $w = $s->modInverse($order);
+        list(, $u1) = $z->multiply($w)->divide($order);
+        list(, $u2) = $r->multiply($w)->divide($order);
+
+        if ($u1 instanceof \phpseclib3\Math\PrimeField\Integer) {
+            $u1 = new \phpseclib3\Math\BigInteger($u1->toBytes(), 256);
+        }
+        if ($u2 instanceof \phpseclib3\Math\PrimeField\Integer) {
+            $u2 = new \phpseclib3\Math\BigInteger($u2->toBytes(), 256);
+        }
+
+        $u1 = $curve->convertInteger($u1);
+        $u2 = $curve->convertInteger($u2);
+
+        list($x1, $y1) = $curve->multiplyAddPoints(
+            [$curve->getBasePoint(), $QA],
+            [$u1, $u2]
+        );
+
+        if ($x1 instanceof \phpseclib3\Math\PrimeField\Integer) {
+            $x1 = new \phpseclib3\Math\BigInteger($x1->toBytes(), 256);
+        } else {
+            $x1 = $curve->convertInteger($x1);
+        }
+        
+        list(, $x1) = $x1->divide($order);
+
+        return $x1->equals($r);
+    }
+
+    private function getArtifactDigest(string $artifactPathOrDigest): string
+    {
+        if (str_starts_with($artifactPathOrDigest, 'sha256:')) {
+            $hash = substr($artifactPathOrDigest, strlen('sha256:'));
+            if (preg_match('/^[a-f0-9]{64}$/', $hash)) {
+                return $hash;
+            }
+            throw new \InvalidArgumentException("Invalid SHA256 digest format");
+        }
+
+        if (!file_exists($artifactPathOrDigest)) {
+            throw new \InvalidArgumentException("Artifact file not found: {$artifactPathOrDigest}");
+        }
+        $hash = hash_file('sha256', $artifactPathOrDigest);
+        if ($hash === false) {
+            throw new \RuntimeException("Failed to hash artifact file");
+        }
+        return $hash;
     }
 }
