@@ -12,6 +12,7 @@
         "php": ">=8.1",
         "ext-openssl": "*",
         "ext-json": "*",
+        "ext-bcmath": "*",
         "google/protobuf": "^3.21 || ^4.21",
         "guzzlehttp/guzzle": "^7.0",
         "league/oauth2-client": "^2.6",
@@ -21,7 +22,12 @@
     },
     "autoload": {
         "psr-4": {
-            "Sigstore\\": "src/"
+            "Sigstore\\": "src/",
+            "Dev\\Sigstore\\": "src/Proto/Dev/Sigstore/",
+            "Google\\Api\\": "src/Proto/Google/Api/",
+            "Google\\Protobuf\\": "src/Proto/Google/Protobuf/",
+            "GPBMetadata\\": "src/Proto/GPBMetadata/",
+            "Io\\Intoto\\": "src/Proto/Io/Intoto/"
         },
         "classmap": [
             "bin/"
