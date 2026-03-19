@@ -382,13 +382,129 @@ class Verifier
             throw new \RuntimeException("Bundle has no supported content");
         }
 
-        // TODO: Implement certificate chain validation against trusted root
-        // TODO: Implement certificate identity and issuer check
-        // TODO: Implement Transparency Log / SCT verification
-        
-        // For now, if the signature matches the cert's public key, we throw a specific exception 
+        // 5. Verify Rekor Inclusion Proof
+        $tlogEntries = $verificationMaterial->getTlogEntries();
+        if (count($tlogEntries) === 0) {
+             throw new \RuntimeException("Bundle does not contain transparency log entries");
+        }
+        $this->verifyRekorInclusionProof($tlogEntries[0], $trustedRoot);
+
+        // For now, if everything matches, we throw a specific exception 
         // so we know we got this far in the tests.
         throw new \RuntimeException("Signature verified against leaf certificate. Certificate chain validation not implemented.");
+    }
+
+    private function verifyRekorInclusionProof(\Dev\Sigstore\Rekor\V1\TransparencyLogEntry $tlogEntry, TrustedRoot $trustedRoot): void
+    {
+        $inclusionProof = $tlogEntry->getInclusionProof();
+        if (!$inclusionProof) {
+            throw new \RuntimeException("Transparency log entry is missing an inclusion proof");
+        }
+        
+        $checkpoint = $inclusionProof->getCheckpoint();
+        if (!$checkpoint) {
+            throw new \RuntimeException("Inclusion proof is missing a checkpoint");
+        }
+        
+        $envelope = $checkpoint->getEnvelope();
+        $parts = explode("\n\u{2014} ", $envelope);
+        if (count($parts) !== 2) {
+             throw new \RuntimeException("Invalid checkpoint format");
+        }
+        
+        $signedBody = rtrim($parts[0], "\n") . "\n";
+        $sigLine = trim($parts[1]);
+        $sigParts = explode(" ", $sigLine);
+        if (count($sigParts) !== 2) {
+             throw new \RuntimeException("Invalid checkpoint signature line");
+        }
+        
+        $origin = $sigParts[0];
+        $keyIdAndSig = base64_decode($sigParts[1]);
+        $keyId = substr($keyIdAndSig, 0, 4);
+        $signature = substr($keyIdAndSig, 4);
+
+        $bodyParts = explode("\n", trim($signedBody));
+        $treeSize = (int)$bodyParts[1];
+        $rootHash = base64_decode($bodyParts[2]);
+
+        $keyFound = false;
+        $sigValid = false;
+
+        foreach ($trustedRoot->getTlogs() as $tlog) {
+            $tlogKeyId = null;
+            if ($tlog->hasCheckpointKeyId() && $tlog->getCheckpointKeyId()->getKeyId() !== '') {
+                 $tlogKeyId = $tlog->getCheckpointKeyId()->getKeyId();
+            } elseif ($tlog->hasLogId() && $tlog->getLogId()->getKeyId() !== '') {
+                 $tlogKeyId = $tlog->getLogId()->getKeyId();
+            }
+            
+            if ($tlogKeyId !== null && substr($tlogKeyId, 0, 4) === $keyId) {
+                 $keyFound = true;
+                 $pubKeyDer = $tlog->getPublicKey()->getRawBytes();
+                 $pubKeyPem = "-----BEGIN PUBLIC KEY-----\n" . chunk_split(base64_encode($pubKeyDer), 64, "\n") . "-----END PUBLIC KEY-----\n";
+                 $pk = \phpseclib3\Crypt\PublicKeyLoader::load($pubKeyPem);
+                 
+                 try {
+                     if ($pk->verify($signedBody, $signature)) {
+                          $sigValid = true;
+                          break;
+                     }
+                 } catch (\Exception $e) {}
+                 
+                 try {
+                     if ($pk->withHash('sha256')->verify($signedBody, $signature)) {
+                          $sigValid = true;
+                          break;
+                     }
+                 } catch (\Exception $e) {}
+            }
+        }
+        
+        if (!$keyFound) {
+             throw new \RuntimeException("Could not find a matching public key for the checkpoint in the trusted root");
+        }
+        if (!$sigValid) {
+             throw new \RuntimeException("Checkpoint signature verification failed");
+        }
+        
+        // Merkle Tree Math
+        $canonicalizedBody = $tlogEntry->getCanonicalizedBody();
+        $leafHash = hash('sha256', "\x00" . $canonicalizedBody, true);
+        
+        $logIndex = $inclusionProof->getLogIndex();
+        $hashes = [];
+        foreach ($inclusionProof->getHashes() as $h) {
+            $hashes[] = $h;
+        }
+        
+        $inner = strlen(decbin($logIndex ^ ($treeSize - 1)));
+        $border = substr_count(decbin($logIndex >> $inner), '1');
+        
+        if (count($hashes) !== ($inner + $border)) {
+             throw new \RuntimeException("Inclusion proof hash count mismatch");
+        }
+        
+        $innerHashes = array_slice($hashes, 0, $inner);
+        $borderHashes = array_slice($hashes, $inner);
+        
+        $seed = $leafHash;
+        for ($i = 0; $i < count($innerHashes); $i++) {
+            $h = $innerHashes[$i];
+            if (($logIndex >> $i) & 1 === 0) {
+                 $seed = hash('sha256', "\x01" . $seed . $h, true);
+            } else {
+                 $seed = hash('sha256', "\x01" . $h . $seed, true);
+            }
+        }
+        
+        foreach ($borderHashes as $h) {
+             $seed = hash('sha256', "\x01" . $h . $seed, true);
+        }
+        
+        if ($seed !== $rootHash) {
+             throw new \RuntimeException("Inclusion proof verification failed: calculated root hash does not match checkpoint");
+        }
     }
 
     private function verifyPrecomputedHash(EC\PublicKey $key, string $hashBytes, string $signature): bool
