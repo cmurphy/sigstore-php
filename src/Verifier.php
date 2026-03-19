@@ -419,6 +419,48 @@ class Verifier
         return $x1->equals($r);
     }
 
+    private function extractTimeFromTsaToken(string $der): ?\DateTime
+    {
+        try {
+            $decoded = \phpseclib3\File\ASN1::decodeBER($der);
+            return $this->findGeneralizedTimeInAsn1($decoded);
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    private function findGeneralizedTimeInAsn1($asnArray): ?\DateTime
+    {
+        if (!is_array($asnArray)) return null;
+
+        foreach ($asnArray as $node) {
+            if (isset($node['type']) && $node['type'] === 24 && isset($node['content'])) {
+                if ($node['content'] instanceof \DateTime) {
+                     return $node['content'];
+                }
+                if (is_string($node['content'])) {
+                     try { return new \DateTime($node['content']); } catch (\Exception $e) {}
+                }
+            }
+            
+            if (isset($node['type']) && $node['type'] === 4 && isset($node['content']) && is_string($node['content'])) {
+                try {
+                    $innerDecoded = \phpseclib3\File\ASN1::decodeBER($node['content']);
+                    $time = $this->findGeneralizedTimeInAsn1($innerDecoded);
+                    if ($time) return $time;
+                } catch (\Exception $e) {
+                    // Ignore
+                }
+            }
+
+            if (isset($node['content']) && is_array($node['content'])) {
+                $res = $this->findGeneralizedTimeInAsn1($node['content']);
+                if ($res) return $res;
+            }
+        }
+        return null;
+    }
+
     private function getArtifactDigest(string $artifactPathOrDigest): string
     {
         if (str_starts_with($artifactPathOrDigest, 'sha256:')) {
