@@ -249,12 +249,115 @@ class Verifier
 
     private function verifyWithCertificate(Bundle $bundle, TrustedRoot $trustedRoot, string $artifactDigest, string $expectedIdentity, string $expectedIssuer): bool
     {
-        // TODO: Implement certificate chain verification against trusted root
+        $verificationMaterial = $bundle->getVerificationMaterial();
+        
+        // 1. Extract Leaf Certificate
+        $leafCertBytes = null;
+        
+        $certChainMessage = $verificationMaterial->getX509CertificateChain();
+        if ($certChainMessage && count($certChainMessage->getCertificates()) > 0) {
+            $leafCertBytes = $certChainMessage->getCertificates()[0]->getRawBytes();
+        } else {
+            $certMessage = $verificationMaterial->getCertificate();
+            if ($certMessage) {
+                $leafCertBytes = $certMessage->getRawBytes();
+            }
+        }
+
+        if ($leafCertBytes === null) {
+            throw new \RuntimeException("Bundle does not contain an X.509 certificate or chain");
+        }
+        
+        $x509 = new \phpseclib3\File\X509();
+        $cert = $x509->loadX509($leafCertBytes);
+        if (!$cert) {
+            throw new \RuntimeException("Failed to parse leaf certificate");
+        }
+
+        // 2. Verify Certificate Identity and Issuer
+        $issuerOid = '1.3.6.1.4.1.57264.1.1';
+        $actualIssuer = $x509->getExtension($issuerOid);
+        if ($actualIssuer !== $expectedIssuer) {
+            throw new \RuntimeException("Certificate issuer mismatch. Expected: {$expectedIssuer}, Got: " . ($actualIssuer ?? 'none'));
+        }
+
+        $sans = $x509->getExtension('id-ce-subjectAltName');
+        $identityMatched = false;
+        if (is_array($sans)) {
+            foreach ($sans as $san) {
+                // Identity could be a URI or an Email
+                if (isset($san['uniformResourceIdentifier']) && $san['uniformResourceIdentifier'] === $expectedIdentity) {
+                    $identityMatched = true;
+                    break;
+                }
+                if (isset($san['rfc822Name']) && $san['rfc822Name'] === $expectedIdentity) {
+                    $identityMatched = true;
+                    break;
+                }
+            }
+        }
+        
+        if (!$identityMatched) {
+             throw new \RuntimeException("Certificate identity mismatch. Expected: {$expectedIdentity}");
+        }
+
+        // 3. Extract Public Key and Verify Signature
+        $publicKey = $x509->getPublicKey();
+        if (!($publicKey instanceof EC)) {
+            throw new \RuntimeException("Only EC keys are currently supported in certificates");
+        }
+
+        $signature = '';
+        $hashAlgo = 'sha256';
+
+        if ($bundle->hasMessageSignature()) {
+            $msgSig = $bundle->getMessageSignature();
+            $signature = $msgSig->getSignature();
+            if (empty($signature)) throw new \RuntimeException("Bundle message signature is empty");
+
+            $messageDigest = $msgSig->getMessageDigest();
+            if (!$messageDigest || $messageDigest->getAlgorithm() !== HashAlgorithm::SHA2_256) {
+                throw new \RuntimeException("Only SHA256 message digest is supported");
+            }
+            if ($messageDigest->getDigest() !== hex2bin($artifactDigest)) {
+                 throw new \RuntimeException("Artifact digest does not match message digest in bundle");
+            }
+            $dataHashed = $messageDigest->getDigest(); // This is the raw digest
+
+            if (!$this->verifyPrecomputedHash($publicKey, $dataHashed, $signature)) {
+                 throw new \RuntimeException("Signature verification failed for MessageSignature with precomputed hash");
+            }
+
+        } elseif ($bundle->hasDsseEnvelope()) {
+            $envelope = $bundle->getDsseEnvelope();
+            if (count($envelope->getSignatures()) === 0) throw new \RuntimeException("DSSE envelope has no signatures");
+            $signature = $envelope->getSignatures()[0]->getSig();
+            if (empty($signature)) throw new \RuntimeException("DSSE signature is empty");
+
+            $payloadType = $envelope->getPayloadType();
+            $payload = $envelope->getPayload();
+            $paeData = sprintf(
+                "DSSEv1 %d %s %d %s",
+                strlen($payloadType), $payloadType,
+                strlen($payload), $payload
+            );
+            
+            $publicKey = $publicKey->withHash($hashAlgo);
+
+            if (!$publicKey->verify($paeData, $signature)) {
+                 throw new \RuntimeException("Signature verification failed for DSSE Envelope");
+            }
+        } else {
+            throw new \RuntimeException("Bundle has no supported content");
+        }
+
+        // TODO: Implement certificate chain validation against trusted root
         // TODO: Implement certificate identity and issuer check
-        // TODO: Extract signature from bundle
-        // TODO: Prepare payload/data that was signed
-        // TODO: Perform signature verification using cert's public key
-        throw new \RuntimeException("verifyWithCertificate not implemented");
+        // TODO: Implement Transparency Log / SCT verification
+        
+        // For now, if the signature matches the cert's public key, we throw a specific exception 
+        // so we know we got this far in the tests.
+        throw new \RuntimeException("Signature verified against leaf certificate. Certificate chain validation not implemented.");
     }
 
     private function verifyPrecomputedHash(EC\PublicKey $key, string $hashBytes, string $signature): bool
