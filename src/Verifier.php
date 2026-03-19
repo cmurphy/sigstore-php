@@ -253,10 +253,15 @@ class Verifier
         
         // 1. Extract Leaf Certificate
         $leafCertBytes = null;
+        $intermediatesBytes = [];
         
         $certChainMessage = $verificationMaterial->getX509CertificateChain();
         if ($certChainMessage && count($certChainMessage->getCertificates()) > 0) {
-            $leafCertBytes = $certChainMessage->getCertificates()[0]->getRawBytes();
+            $certs = $certChainMessage->getCertificates();
+            $leafCertBytes = $certs[0]->getRawBytes();
+            for ($i = 1; $i < count($certs); $i++) {
+                 $intermediatesBytes[] = $certs[$i]->getRawBytes();
+            }
         } else {
             $certMessage = $verificationMaterial->getCertificate();
             if ($certMessage) {
@@ -269,9 +274,28 @@ class Verifier
         }
         
         $x509 = new \phpseclib3\File\X509();
+        
+        // Load Trusted Roots
+        foreach ($trustedRoot->getCertificateAuthorities() as $ca) {
+            if ($ca->hasCertChain()) {
+                foreach ($ca->getCertChain()->getCertificates() as $trustedCert) {
+                     $x509->loadCA($trustedCert->getRawBytes());
+                }
+            }
+        }
+        
+        // Load Intermediates as CAs so they can build the chain
+        foreach ($intermediatesBytes as $intermediate) {
+             $x509->loadCA($intermediate);
+        }
+
         $cert = $x509->loadX509($leafCertBytes);
         if (!$cert) {
             throw new \RuntimeException("Failed to parse leaf certificate");
+        }
+
+        if (!$x509->validateSignature()) {
+            throw new \RuntimeException("Failed to validate certificate chain against trusted roots");
         }
 
         // 2. Verify Certificate Identity and Issuer
@@ -301,7 +325,14 @@ class Verifier
              throw new \RuntimeException("Certificate identity mismatch. Expected: {$expectedIdentity}");
         }
 
-        // 3. Extract Public Key and Verify Signature
+        // 3. Verify SCT (Signed Certificate Timestamp) Presence
+        $sctOid = '1.3.6.1.4.1.11129.2.4.2';
+        $sctExt = $x509->getExtension($sctOid);
+        if (!$sctExt) {
+            throw new \RuntimeException("Certificate does not contain an SCT extension");
+        }
+
+        // 4. Extract Public Key and Verify Signature
         $publicKey = $x509->getPublicKey();
         if (!($publicKey instanceof EC)) {
             throw new \RuntimeException("Only EC keys are currently supported in certificates");
