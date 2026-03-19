@@ -58,14 +58,15 @@ The SDK will be a Composer package with a modular design. A facade, `SigstoreCli
 *   Manages the bundle verification process:
     1.  Deserialize the `Bundle` from JSON.
     2.  Extract RFC 3161 timestamp from `timestamp_verification_data`. **Note:** For V2 compliance, we exclusively use this RFC 3161 timestamp to establish signing time. We completely ignore Rekor's `integratedTime` and `InclusionPromise` (SET) for time-checking. If an RFC 3161 timestamp is missing, verification fails for certificates.
-    3.  **Phase 1 (Time check):** Parse the ASN.1 `TimeStampToken` (using `fgrosse/phpasn1`) to extract the `GeneralizedTime`.
+    3.  **Phase 1 (Time check):** Parse the ASN.1 `TimeStampToken` (using `phpseclib3\File\ASN1`) to extract the `GeneralizedTime`.
     4.  Verify the Fulcio certificate chain against the `TrustedRoot` at the extracted timestamp time.
     5.  **Phase 2 (TSA Crypto):** Verify the TSA's signature on the timestamp token against the `timestamp_authorities` in `TrustedRoot`, and verify the token's message imprint matches the artifact signature.
-    6.  Verify the Certificate Transparency Log SCT embedded in the Fulcio certificate.
-    7.  Verify the Rekor v2 entry:
-        *   Verify the checkpoint signature against the `TrustedRoot`.
-        *   Verify the inclusion proof.
-        *   Match the log entry content with the bundle content.
+    6.  **Phase 1 (SCT check):** Extract and verify the presence of the Certificate Transparency Log SCT extension embedded in the Fulcio certificate. **Phase 2 (SCT Crypto):** Verify the SCT signature against the `ctlogs` in `TrustedRoot`.
+    7.  Verify the Rekor v2 entry (Inclusion Proof):
+        *   Extract the `TransparencyLogEntry` from the bundle.
+        *   **Checkpoint Verification:** Parse the text-based Checkpoint (Signed Note) from the `InclusionProof`. Extract the `tree_size` and `root_hash`. Reconstruct the signed body and verify the signature using the appropriate `TransparencyLogInstance` public key from the `TrustedRoot`.
+        *   **Merkle Tree Math:** Calculate the leaf hash (`SHA256(0x00 . canonicalized_body)`). Compute the root hash by chaining the provided `hashes` from the `InclusionProof` with the leaf hash, using bitwise math on the `log_index` and `tree_size` to determine ordering.
+        *   **Validation:** Assert that the computed root hash exactly matches the `root_hash` from the verified Checkpoint.
     8.  Verify the artifact signature using the public key from the Fulcio certificate.
     9.  Check against policy (identity, issuer) provided in options.
 *   Configured with `TrustedRoot`.
