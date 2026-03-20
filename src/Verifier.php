@@ -229,6 +229,7 @@ class Verifier
 
             $payloadType = $envelope->getPayloadType();
             $payload = $envelope->getPayload();
+            $this->verifyInTotoSubject($payloadType, $payload, $artifactDigest);
             $paeData = sprintf(
                 "DSSEv1 %d %s %d %s",
                 strlen($payloadType), $payloadType,
@@ -292,6 +293,45 @@ class Verifier
         $cert = $x509->loadX509($leafCertBytes);
         if (!$cert) {
             throw new \RuntimeException("Failed to parse leaf certificate");
+        }
+
+        // 1.5 Extract Signature Early for TSA verification
+        $bundleSignature = '';
+        if ($bundle->hasMessageSignature()) {
+             $bundleSignature = $bundle->getMessageSignature()->getSignature();
+             if (empty($bundleSignature)) throw new \RuntimeException("Bundle message signature is empty");
+        } elseif ($bundle->hasDsseEnvelope()) {
+             $envelope = $bundle->getDsseEnvelope();
+             if (count($envelope->getSignatures()) === 0) throw new \RuntimeException("DSSE envelope has no signatures");
+             $bundleSignature = $envelope->getSignatures()[0]->getSig();
+             if (empty($bundleSignature)) throw new \RuntimeException("DSSE signature is empty");
+        }
+
+        // 2. Extract and Validate RFC 3161 Timestamp
+        $timestampData = $verificationMaterial->getTimestampVerificationData();
+        if (!$timestampData || count($timestampData->getRfc3161Timestamps()) === 0) {
+            throw new \RuntimeException("Certificate validation requires an RFC 3161 timestamp");
+        }
+        
+        $tsaTokenBytes = $timestampData->getRfc3161Timestamps()[0]->getSignedTimestamp();
+        $tstInfo = $this->extractTstInfoData($tsaTokenBytes);
+        if (!$tstInfo || !($tstInfo['time'] instanceof \DateTime)) {
+             throw new \RuntimeException("Failed to extract time and message imprint from RFC 3161 timestamp token");
+        }
+        
+        $signingTime = $tstInfo['time'];
+        $messageImprint = $tstInfo['hashedMessage'];
+
+        // We also cryptographically verify the TSA signature and message imprint
+        if (!\Sigstore\TsaVerifier::verify($tsaTokenBytes, $bundleSignature, $trustedRoot, $signingTime)) {
+             throw new \RuntimeException("TSA token cryptographic verification failed");
+        }
+
+        if (!$x509->validateDate($signingTime)) {
+            throw new \RuntimeException(sprintf(
+                "Signature timestamp (%s) is outside the certificate validity period",
+                $signingTime->format('Y-m-d H:i:s')
+            ));
         }
 
         if (!$x509->validateSignature()) {
@@ -367,6 +407,7 @@ class Verifier
 
             $payloadType = $envelope->getPayloadType();
             $payload = $envelope->getPayload();
+            $this->verifyInTotoSubject($payloadType, $payload, $artifactDigest);
             $paeData = sprintf(
                 "DSSEv1 %d %s %d %s",
                 strlen($payloadType), $payloadType,
@@ -382,25 +423,51 @@ class Verifier
             throw new \RuntimeException("Bundle has no supported content");
         }
 
+        // Verify the TSA message imprint matches the artifact signature
+        if ($messageImprint !== null && hash('sha256', $signature, true) !== $messageImprint) {
+             throw new \RuntimeException("TSA message imprint does not match artifact signature");
+        }
+
         // 5. Verify Rekor Inclusion Proof
         $tlogEntries = $verificationMaterial->getTlogEntries();
         if (count($tlogEntries) === 0) {
              throw new \RuntimeException("Bundle does not contain transparency log entries");
         }
-        $this->verifyRekorInclusionProof($tlogEntries[0], $trustedRoot);
+        $this->verifyRekorInclusionProof($tlogEntries[0], $trustedRoot, $signature);
 
-        // For now, if everything matches, we throw a specific exception 
-        // so we know we got this far in the tests.
-        throw new \RuntimeException("Signature verified against leaf certificate. Certificate chain validation not implemented.");
+        // If we reach this point, all verification steps passed
+        return true;
     }
 
-    private function verifyRekorInclusionProof(\Dev\Sigstore\Rekor\V1\TransparencyLogEntry $tlogEntry, TrustedRoot $trustedRoot): void
+    private function verifyRekorInclusionProof(\Dev\Sigstore\Rekor\V1\TransparencyLogEntry $tlogEntry, TrustedRoot $trustedRoot, string $bundleSignature): void
     {
         $inclusionProof = $tlogEntry->getInclusionProof();
         if (!$inclusionProof) {
             throw new \RuntimeException("Transparency log entry is missing an inclusion proof");
         }
+
+        $canonicalizedBodyBytes = $tlogEntry->getCanonicalizedBody();
+        $canonicalizedBody = json_decode($canonicalizedBodyBytes, true);
         
+        $logSignature = '';
+        if (isset($canonicalizedBody['spec']['dsseV002']['signatures'][0]['content'])) {
+            $logSignature = base64_decode($canonicalizedBody['spec']['dsseV002']['signatures'][0]['content']);
+        } elseif (isset($canonicalizedBody['spec']['hashedRekordV002']['signature']['content'])) {
+            $logSignature = base64_decode($canonicalizedBody['spec']['hashedRekordV002']['signature']['content']);
+        } elseif (isset($canonicalizedBody['spec']['hashedrekordV002']['signature']['content'])) { // Keep for backward compat just in case
+            $logSignature = base64_decode($canonicalizedBody['spec']['hashedrekordV002']['signature']['content']);
+        } elseif (isset($canonicalizedBody['spec']['intotoV002']['signature']['content'])) {
+            $logSignature = base64_decode($canonicalizedBody['spec']['intotoV002']['signature']['content']);
+        } elseif ($canonicalizedBody['kind'] === 'intoto' && isset($canonicalizedBody['spec']['content']['envelope']['signatures'][0]['sig'])) {
+            $logSignature = base64_decode(base64_decode($canonicalizedBody['spec']['content']['envelope']['signatures'][0]['sig']));
+        } else {
+            throw new \RuntimeException("Unsupported or invalid canonicalized body format");
+        }
+        
+        if ($logSignature !== $bundleSignature) {
+            throw new \RuntimeException("Signature in transparency log does not match signature in bundle");
+        }
+
         $checkpoint = $inclusionProof->getCheckpoint();
         if (!$checkpoint) {
             throw new \RuntimeException("Inclusion proof is missing a checkpoint");
@@ -408,22 +475,11 @@ class Verifier
         
         $envelope = $checkpoint->getEnvelope();
         $parts = explode("\n\u{2014} ", $envelope);
-        if (count($parts) !== 2) {
-             throw new \RuntimeException("Invalid checkpoint format");
+        if (count($parts) < 2) {
+             throw new \RuntimeException("Invalid checkpoint format: no signatures found");
         }
         
         $signedBody = rtrim($parts[0], "\n") . "\n";
-        $sigLine = trim($parts[1]);
-        $sigParts = explode(" ", $sigLine);
-        if (count($sigParts) !== 2) {
-             throw new \RuntimeException("Invalid checkpoint signature line");
-        }
-        
-        $origin = $sigParts[0];
-        $keyIdAndSig = base64_decode($sigParts[1]);
-        $keyId = substr($keyIdAndSig, 0, 4);
-        $signature = substr($keyIdAndSig, 4);
-
         $bodyParts = explode("\n", trim($signedBody));
         $treeSize = (int)$bodyParts[1];
         $rootHash = base64_decode($bodyParts[2]);
@@ -431,33 +487,45 @@ class Verifier
         $keyFound = false;
         $sigValid = false;
 
-        foreach ($trustedRoot->getTlogs() as $tlog) {
-            $tlogKeyId = null;
-            if ($tlog->hasCheckpointKeyId() && $tlog->getCheckpointKeyId()->getKeyId() !== '') {
-                 $tlogKeyId = $tlog->getCheckpointKeyId()->getKeyId();
-            } elseif ($tlog->hasLogId() && $tlog->getLogId()->getKeyId() !== '') {
-                 $tlogKeyId = $tlog->getLogId()->getKeyId();
-            }
+        // Iterate through all provided signatures until we find a valid one
+        for ($i = 1; $i < count($parts); $i++) {
+            $sigLine = trim($parts[$i]);
+            $sigParts = explode(" ", $sigLine);
+            if (count($sigParts) !== 2) continue; // Ignore malformed signature lines
             
-            if ($tlogKeyId !== null && substr($tlogKeyId, 0, 4) === $keyId) {
-                 $keyFound = true;
-                 $pubKeyDer = $tlog->getPublicKey()->getRawBytes();
-                 $pubKeyPem = "-----BEGIN PUBLIC KEY-----\n" . chunk_split(base64_encode($pubKeyDer), 64, "\n") . "-----END PUBLIC KEY-----\n";
-                 $pk = \phpseclib3\Crypt\PublicKeyLoader::load($pubKeyPem);
-                 
-                 try {
-                     if ($pk->verify($signedBody, $signature)) {
-                          $sigValid = true;
-                          break;
-                     }
-                 } catch (\Exception $e) {}
-                 
-                 try {
-                     if ($pk->withHash('sha256')->verify($signedBody, $signature)) {
-                          $sigValid = true;
-                          break;
-                     }
-                 } catch (\Exception $e) {}
+            $origin = $sigParts[0];
+            $keyIdAndSig = base64_decode($sigParts[1]);
+            $keyId = substr($keyIdAndSig, 0, 4);
+            $signature = substr($keyIdAndSig, 4);
+
+            foreach ($trustedRoot->getTlogs() as $tlog) {
+                $tlogKeyId = null;
+                if ($tlog->hasCheckpointKeyId() && $tlog->getCheckpointKeyId()->getKeyId() !== '') {
+                     $tlogKeyId = $tlog->getCheckpointKeyId()->getKeyId();
+                } elseif ($tlog->hasLogId() && $tlog->getLogId()->getKeyId() !== '') {
+                     $tlogKeyId = $tlog->getLogId()->getKeyId();
+                }
+                
+                if ($tlogKeyId !== null && substr($tlogKeyId, 0, 4) === $keyId) {
+                     $keyFound = true;
+                     $pubKeyDer = $tlog->getPublicKey()->getRawBytes();
+                     $pubKeyPem = "-----BEGIN PUBLIC KEY-----\n" . chunk_split(base64_encode($pubKeyDer), 64, "\n") . "-----END PUBLIC KEY-----\n";
+                     $pk = \phpseclib3\Crypt\PublicKeyLoader::load($pubKeyPem);
+                     
+                     try {
+                         if ($pk->verify($signedBody, $signature)) {
+                              $sigValid = true;
+                              break 2; // Break out of both loops
+                         }
+                     } catch (\Exception $e) {}
+                     
+                     try {
+                         if ($pk->withHash('sha256')->verify($signedBody, $signature)) {
+                              $sigValid = true;
+                              break 2; // Break out of both loops
+                         }
+                     } catch (\Exception $e) {}
+                }
             }
         }
         
@@ -478,7 +546,8 @@ class Verifier
             $hashes[] = $h;
         }
         
-        $inner = strlen(decbin($logIndex ^ ($treeSize - 1)));
+        $xor = $logIndex ^ ($treeSize - 1);
+        $inner = $xor === 0 ? 0 : strlen(decbin($xor));
         $border = substr_count(decbin($logIndex >> $inner), '1');
         
         if (count($hashes) !== ($inner + $border)) {
@@ -566,46 +635,102 @@ class Verifier
         return $x1->equals($r);
     }
 
-    private function extractTimeFromTsaToken(string $der): ?\DateTime
+    private function extractTstInfoData(string $der): ?array
     {
         try {
             $decoded = \phpseclib3\File\ASN1::decodeBER($der);
-            return $this->findGeneralizedTimeInAsn1($decoded);
+            return $this->findTstDataInAsn1($decoded);
         } catch (\Exception $e) {
             return null;
         }
     }
 
-    private function findGeneralizedTimeInAsn1($asnArray): ?\DateTime
+    private function findTstDataInAsn1($asnArray): ?array
     {
         if (!is_array($asnArray)) return null;
 
         foreach ($asnArray as $node) {
-            if (isset($node['type']) && $node['type'] === 24 && isset($node['content'])) {
-                if ($node['content'] instanceof \DateTime) {
-                     return $node['content'];
-                }
-                if (is_string($node['content'])) {
-                     try { return new \DateTime($node['content']); } catch (\Exception $e) {}
-                }
-            }
-            
+            // Check for Octet String (type 4) which might contain the TSTInfo
             if (isset($node['type']) && $node['type'] === 4 && isset($node['content']) && is_string($node['content'])) {
                 try {
                     $innerDecoded = \phpseclib3\File\ASN1::decodeBER($node['content']);
-                    $time = $this->findGeneralizedTimeInAsn1($innerDecoded);
-                    if ($time) return $time;
-                } catch (\Exception $e) {
-                    // Ignore
-                }
+                    
+                    // We need to define a closure here because PHP doesn't support nested named functions the way we want inside a class method cleanly without polluting the class space
+                    $findTstData = function($arr) use (&$findTstData) {
+                        if (!is_array($arr)) return null;
+                        
+                        $time = null;
+                        $hashedMessage = null;
+                        
+                        foreach ($arr as $item) {
+                            if (isset($item['type']) && $item['type'] === 24) { // GeneralizedTime
+                                $time = $item['content'];
+                            }
+                            if (isset($item['type']) && $item['type'] === 16 && is_array($item['content'])) {
+                                // MessageImprint SEQUENCE?
+                                if (count($item['content']) === 2 && $item['content'][1]['type'] === 4) {
+                                    $hashedMessage = $item['content'][1]['content'];
+                                }
+                            }
+                        }
+                        
+                        if ($time !== null && $hashedMessage !== null) {
+                            if (is_string($time)) {
+                                 try { $time = new \DateTime($time); } catch (\Exception $e) {}
+                            }
+                            return ['time' => $time, 'hashedMessage' => $hashedMessage];
+                        }
+                        
+                        foreach ($arr as $item) {
+                            if (isset($item['content']) && is_array($item['content'])) {
+                                $res = $findTstData($item['content']);
+                                if ($res) return $res;
+                            }
+                        }
+                        return null;
+                    };
+                    
+                    $res = $findTstData($innerDecoded);
+                    if ($res) return $res;
+                    
+                } catch (\Exception $e) {}
             }
 
             if (isset($node['content']) && is_array($node['content'])) {
-                $res = $this->findGeneralizedTimeInAsn1($node['content']);
+                $res = $this->findTstDataInAsn1($node['content']);
                 if ($res) return $res;
             }
         }
         return null;
+    }
+
+    private function verifyInTotoSubject(string $payloadType, string $payloadBytes, string $expectedDigestHex): void
+    {
+        if ($payloadType !== 'application/vnd.in-toto+json') {
+            return;
+        }
+
+        $payload = json_decode($payloadBytes, true);
+        if (!$payload || !isset($payload['subject']) || !is_array($payload['subject'])) {
+            throw new \RuntimeException("In-toto payload is missing a valid subject array");
+        }
+
+        $digestFound = false;
+        foreach ($payload['subject'] as $subject) {
+            if (isset($subject['digest']) && is_array($subject['digest'])) {
+                foreach ($subject['digest'] as $alg => $val) {
+                    // Check for sha256 or sha2-256
+                    if (in_array(strtolower($alg), ['sha256', 'sha2-256', 'sha2_256']) && strtolower($val) === strtolower($expectedDigestHex)) {
+                        $digestFound = true;
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        if (!$digestFound) {
+            throw new \RuntimeException("Artifact digest not found in in-toto subject");
+        }
     }
 
     private function getArtifactDigest(string $artifactPathOrDigest): string
