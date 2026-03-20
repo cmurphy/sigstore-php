@@ -156,18 +156,41 @@ The SDK will use the generated Protobuf classes for the `Bundle`. Serialization 
 
 The `--in-toto` flag on `sign-bundle` signals that the input file is an in-toto attestation. The `Signer` will wrap this payload in a DSSE envelope and use the `DSSELogEntryV002` type when interacting with Rekor. Otherwise, `HashedRekordLogEntryV002` will be used with the artifact hash.
 
-## 12. Testing Strategy
+## 12. TUF Client Architecture
+
+The Sigstore ecosystem relies on The Update Framework (TUF) to securely distribute and update the foundational `trusted_root.json` file. This mitigates a multitude of supply chain attacks, including rollback, freeze, mix-and-match, and arbitrary software updates.
+
+### 12.1. Leveraging `php-tuf/php-tuf`
+
+Implementing the exhaustive TUF specification from scratch is highly complex and error-prone. To ensure cryptographic rigor and security, the PHP SDK will leverage the `php-tuf/php-tuf` library. This library handles the intricate details of Canonical JSON serialization, cryptographic signature validation, threshold counting, and the strict 7-step TUF client update workflow.
+
+### 12.2. Architectural Implementation
+
+The TUF client logic will be encapsulated within the `Sigstore\Tuf` namespace to maintain separation of concerns from the core artifact verification logic.
+
+1.  **Trust Anchors:** The SDK will ship with the initial public good `root.json` (for `sigstore.dev`) and `staging_root.json` (for `sigstage.dev`). These will be stored in `src/Tuf/Anchors/` and named `1.root.json` to bootstrap the TUF update process.
+2.  **`SigstoreTufClient` Wrapper:** A high-level wrapper class will orchestrate the `php-tuf` components:
+    *   **Loader:** A custom `GuzzleLoader` implementing `Tuf\Loader\LoaderInterface` will handle HTTP GET requests to the Sigstore TUF CDN (`https://tuf-repo-cdn.sigstore.dev` or `https://tuf-repo-cdn.sigstage.dev`).
+    *   **Storage:** The `php-tuf` `FileStorage` class will persist downloaded metadata (`timestamp.json`, `snapshot.json`, `targets.json`) to a local `.sigstore/tuf/` cache directory, preventing redundant downloads and ensuring offline resilience when possible.
+    *   **Updater:** The core `Tuf\Client\Updater` will execute the full TUF update cycle (Root -> Timestamp -> Snapshot -> Targets).
+3.  **Target Retrieval:** When the `Verifier` (or the CLI) requests the `trusted_root.json` target, the `SigstoreTufClient` will trigger an update, securely download the target, verify its cryptographic hashes (SHA256/SHA512) and length against the signed `targets.json` metadata, and return the verified file.
+
+### 12.3. Integration with Verification
+
+If a user or the `sigstore-conformance` CLI does not explicitly provide a `--trusted-root` file, the SDK will automatically instantiate the `SigstoreTufClient`, resolve the correct repository (Production vs. Staging), fetch the latest verified `trusted_root.json`, parse it into the `TrustedRoot` protobuf object, and seamlessly pass it into the `Verifier`.
+
+## 13. Testing Strategy
 
 The SDK employs a dual-layered testing approach to ensure both internal correctness and strict adherence to the Sigstore specification.
 
-### 12.1. Integration Testing (Conformance Suite)
+### 13.1. Integration Testing (Conformance Suite)
 
 The primary mechanism for end-to-end integration testing is the official `sigstore-conformance` Python test suite.
 *   The `sigstore-cli.php` wrapper acts as the entrypoint for the conformance suite.
 *   This suite rigorously exercises the complete signing and verification workflows against massive, real-world Sigstore bundles (both happy paths and mathematically/cryptographically malformed bundles).
 *   Execution is orchestrated via `run-conformance.sh`.
 
-### 12.2. Unit Testing (PHPUnit)
+### 13.2. Unit Testing (PHPUnit)
 
 While the conformance suite guarantees interoperability, unit tests ensure the stability and correctness of individual, isolated PHP components. The SDK uses **PHPUnit** as its foundational testing framework.
 
