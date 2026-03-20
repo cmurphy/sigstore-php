@@ -579,7 +579,7 @@ class Verifier
         $seed = $leafHash;
         for ($i = 0; $i < count($innerHashes); $i++) {
             $h = $innerHashes[$i];
-            if (($logIndex >> $i) & 1 === 0) {
+            if ((($logIndex >> $i) & 1) === 0) {
                  $seed = hash('sha256', "\x01" . $seed . $h, true);
             } else {
                  $seed = hash('sha256', "\x01" . $h . $seed, true);
