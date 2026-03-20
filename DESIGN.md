@@ -155,3 +155,35 @@ The SDK will use the generated Protobuf classes for the `Bundle`. Serialization 
 ## 11. In-Toto Handling
 
 The `--in-toto` flag on `sign-bundle` signals that the input file is an in-toto attestation. The `Signer` will wrap this payload in a DSSE envelope and use the `DSSELogEntryV002` type when interacting with Rekor. Otherwise, `HashedRekordLogEntryV002` will be used with the artifact hash.
+
+## 12. Testing Strategy
+
+The SDK employs a dual-layered testing approach to ensure both internal correctness and strict adherence to the Sigstore specification.
+
+### 12.1. Integration Testing (Conformance Suite)
+
+The primary mechanism for end-to-end integration testing is the official `sigstore-conformance` Python test suite.
+*   The `sigstore-cli.php` wrapper acts as the entrypoint for the conformance suite.
+*   This suite rigorously exercises the complete signing and verification workflows against massive, real-world Sigstore bundles (both happy paths and mathematically/cryptographically malformed bundles).
+*   Execution is orchestrated via `run-conformance.sh`.
+
+### 12.2. Unit Testing (PHPUnit)
+
+While the conformance suite guarantees interoperability, unit tests ensure the stability and correctness of individual, isolated PHP components. The SDK uses **PHPUnit** as its foundational testing framework.
+
+**Principles:**
+*   **Isolation:** Unit tests must not make real network requests to Fulcio, Rekor, or external TSAs. Interactions with HTTP APIs will be mocked using Guzzle's `MockHandler` or PHPUnit mocks.
+*   **Focused Assets:** Tests will rely on minimal, isolated binary blobs (e.g., a single raw DER certificate, a specific extracted SCT byte string, or a pre-computed OpenSSL CMS response) stored in `tests/assets/` rather than parsing monolithic conformance JSON bundles.
+*   **Data Providers:** Mathematical and parsing edge cases (like Merkle Tree root hash calculations or ASN.1 length decoding) will be exhaustively tested using PHPUnit Data Providers to iterate through multiple scenarios in a single test method.
+
+**Targeted Areas:**
+1.  **Cryptographic Verification (`SctVerifier`, `TsaVerifier`):**
+    *   Verify correct ASN.1 parsing and extension extraction (e.g., gracefully handling missing or malformed SCT extensions).
+    *   Ensure cryptographic signature math passes for valid inputs and explicitly fails (throws specific Exceptions) for tampered bytes or incorrect public keys.
+2.  **Rekor Inclusion Proofs:**
+    *   Test the parsing logic of text-based Checkpoints (Signed Notes).
+    *   Test Merkle Tree math, explicitly covering edge cases like `log_index = 0` bitwise operations.
+3.  **Bundle Deserialization (`Verifier`):**
+    *   Verify that Protobuf-generated objects are correctly hydrated from JSON representations.
+4.  **Signing Orchestration (`Signer`):**
+    *   Mock external service responses (OIDC, Fulcio, Rekor) and assert that the `Signer` correctly formats the requests, processes the responses, and successfully assembles a compliant `Bundle` object.

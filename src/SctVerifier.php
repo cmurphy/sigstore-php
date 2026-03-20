@@ -16,7 +16,7 @@ class SctVerifier
      * @param \Dev\Sigstore\Trustroot\V1\TrustedRoot $trustedRoot The Sigstore TrustedRoot.
      * @throws \RuntimeException If the SCT cannot be verified.
      */
-    public static function verify(string $leafCertDer, string $issuerCertDer, \Dev\Sigstore\Trustroot\V1\TrustedRoot $trustedRoot): void
+    public static function verify(string $leafCertDer, string $issuerCertDer, \Dev\Sigstore\Trustroot\V1\TrustedRoot $trustedRoot, int $threshold = 1): void
     {
         $x509 = new X509();
         $cert = $x509->loadX509($leafCertDer);
@@ -31,71 +31,106 @@ class SctVerifier
         $decodedSct = ASN1::decodeBER($sctExt);
         $sctBytesRaw = $decodedSct[0]['content'];
 
-        $sctLen = unpack('n', substr($sctBytesRaw, 2, 2))[1];
-        $sctBytes = substr($sctBytesRaw, 4, $sctLen);
-
-        $version = ord($sctBytes[0]);
-        if ($version !== 0) {
-            throw new \RuntimeException("Unsupported SCT version: $version");
-        }
-
-        $logId = substr($sctBytes, 1, 32);
-        $timestamp = unpack('J', substr($sctBytes, 33, 8))[1];
-        $extLen = unpack('n', substr($sctBytes, 41, 2))[1];
-        $extensions = substr($sctBytes, 43, $extLen);
-
-        $sigOffset = 43 + $extLen;
-        $hashAlg = ord($sctBytes[$sigOffset]);
-        $sigAlg = ord($sctBytes[$sigOffset + 1]);
-        if ($hashAlg !== 4) { // SHA256
-            throw new \RuntimeException("Unsupported SCT hash algorithm (expected SHA256)");
-        }
-
-        $sigLen = unpack('n', substr($sctBytes, $sigOffset + 2, 2))[1];
-        $signature = substr($sctBytes, $sigOffset + 4, $sigLen);
-
-        // 2. Strip SCT from TBSCertificate
+        $listLen = unpack('n', substr($sctBytesRaw, 0, 2))[1];
+        $offset = 2;
+        
+        // Prepare digitally-signed struct prefix since TBS and IssuerKeyId don't change per SCT
         $tbsPrecert = self::stripSctExtension($leafCertDer);
-
-        // 3. Get Issuer Key ID
         $issuerX509 = new X509();
         $issuerX509->loadX509($issuerCertDer);
         $issuerPubKeyPem = $issuerX509->getPublicKey()->toString('PKCS8');
         $issuerSpkiDer = base64_decode(str_replace(['-----BEGIN PUBLIC KEY-----', '-----END PUBLIC KEY-----', "\r", "\n"], '', $issuerPubKeyPem));
         $issuerKeyId = hash('sha256', $issuerSpkiDer, true);
-
-        // 4. Pack digitally-signed struct
+        
         $tbsLen = strlen($tbsPrecert);
         $len1 = ($tbsLen >> 16) & 0xFF;
         $len2 = ($tbsLen >> 8) & 0xFF;
         $len3 = $tbsLen & 0xFF;
+        
+        $validSctCount = 0;
+        $lastError = null;
 
-        // precert_entry is 1
-        $digitallySigned = pack("CCJn", 0, 0, $timestamp, 1) . $issuerKeyId . pack("CCC", $len1, $len2, $len3) . $tbsPrecert . pack("n", $extLen) . $extensions;
+        while ($offset < 2 + $listLen) {
+            try {
+                $sctLen = unpack('n', substr($sctBytesRaw, $offset, 2))[1];
+                $sctBytes = substr($sctBytesRaw, $offset + 2, $sctLen);
+                $offset += 2 + $sctLen;
 
-        // 5. Find CT Log Public Key
-        $ctKeyPem = null;
-        foreach ($trustedRoot->getCtlogs() as $ctlog) {
-            $ctKeyDer = $ctlog->getPublicKey()->getRawBytes();
-            $ctLogId = hash('sha256', $ctKeyDer, true);
-            if ($ctLogId === $logId) {
+                $version = ord($sctBytes[0]);
+                if ($version !== 0) {
+                    throw new \RuntimeException("Unsupported SCT version: $version");
+                }
+
+                $logId = substr($sctBytes, 1, 32);
+                $timestamp = unpack('J', substr($sctBytes, 33, 8))[1];
+                $extLen = unpack('n', substr($sctBytes, 41, 2))[1];
+                $extensions = substr($sctBytes, 43, $extLen);
+
+                $sigOffset = 43 + $extLen;
+                $hashAlg = ord($sctBytes[$sigOffset]);
+                $sigAlg = ord($sctBytes[$sigOffset + 1]);
+                if ($hashAlg !== 4) { // SHA256
+                    throw new \RuntimeException("Unsupported SCT hash algorithm (expected SHA256)");
+                }
+
+                $sigLen = unpack('n', substr($sctBytes, $sigOffset + 2, 2))[1];
+                $signature = substr($sctBytes, $sigOffset + 4, $sigLen);
+
+                $digitallySigned = pack("CCJn", 0, 0, $timestamp, 1) . $issuerKeyId . pack("CCC", $len1, $len2, $len3) . $tbsPrecert . pack("n", $extLen) . $extensions;
+
+                $ctlogInstance = null;
+                foreach ($trustedRoot->getCtlogs() as $ctlog) {
+                    $ctKeyDer = $ctlog->getPublicKey()->getRawBytes();
+                    $ctLogId = hash('sha256', $ctKeyDer, true);
+                    if ($ctLogId === $logId) {
+                        $ctlogInstance = $ctlog;
+                        break;
+                    }
+                }
+
+                if (!$ctlogInstance) {
+                    throw new \RuntimeException("CT Log key not found for log ID: " . bin2hex($logId));
+                }
+                
+                // Check time constraints if validFor is present
+                $ctKeyDer = $ctlogInstance->getPublicKey()->getRawBytes();
+                $validFor = $ctlogInstance->getPublicKey()->getValidFor();
+                if ($validFor) {
+                    $start = $validFor->getStart();
+                    if ($start) {
+                        $startTimeMs = $start->getSeconds() * 1000 + (int)($start->getNanos() / 1000000);
+                        if ($timestamp < $startTimeMs) {
+                            throw new \RuntimeException("SCT timestamp is before CT log key validity start");
+                        }
+                    }
+                    $end = $validFor->getEnd();
+                    if ($end) {
+                        $endTimeMs = $end->getSeconds() * 1000 + (int)($end->getNanos() / 1000000);
+                        if ($timestamp > $endTimeMs) {
+                            throw new \RuntimeException("SCT timestamp is after CT log key validity end");
+                        }
+                    }
+                }
+
                 $ctKeyPem = "-----BEGIN PUBLIC KEY-----\n" . chunk_split(base64_encode($ctKeyDer), 64, "\n") . "-----END PUBLIC KEY-----\n";
-                break;
+                $pk = PublicKeyLoader::load($ctKeyPem);
+                $isValid = $pk->withHash('sha256')->verify($digitallySigned, $signature);
+
+                if (!$isValid) {
+                    throw new \RuntimeException("SCT signature verification failed");
+                }
+                
+                $validSctCount++;
+            } catch (\RuntimeException $e) {
+                $lastError = $e;
             }
         }
 
-        if (!$ctKeyPem) {
-            throw new \RuntimeException("CT Log key not found for log ID: " . bin2hex($logId));
-        }
-
-        $pk = PublicKeyLoader::load($ctKeyPem);
-        $isValid = $pk->withHash('sha256')->verify($digitallySigned, $signature);
-
-        if (!$isValid) {
-            error_log(sprintf("SCT Verification Failed! logId=%s, sigLen=%d, digitallySignedLen=%d", bin2hex($logId), strlen($signature), strlen($digitallySigned)));
-            error_log("Leaf Cert MD5: " . md5($leafCertDer));
-            error_log("Issuer Cert MD5: " . md5($issuerCertDer));
-            throw new \RuntimeException("SCT signature verification failed");
+        if ($validSctCount < $threshold) {
+            if ($lastError) {
+                throw $lastError;
+            }
+            throw new \RuntimeException("Failed to find enough valid SCTs (required: $threshold, found: $validSctCount)");
         }
     }
 
