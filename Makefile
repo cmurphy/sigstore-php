@@ -27,4 +27,4 @@ all: clean-protos generate-protos
 .PHONY: test
 test:
 	@echo "Running unit tests..."
-	@./vendor/bin/phpunit
+	@./vendor/bin/phpunit ./tests/
