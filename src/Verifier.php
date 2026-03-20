@@ -365,12 +365,31 @@ class Verifier
              throw new \RuntimeException("Certificate identity mismatch. Expected: {$expectedIdentity}");
         }
 
-        // 3. Verify SCT (Signed Certificate Timestamp) Presence
+        // 3. Verify SCT (Signed Certificate Timestamp) Presence and Cryptography
         $sctOid = '1.3.6.1.4.1.11129.2.4.2';
         $sctExt = $x509->getExtension($sctOid);
         if (!$sctExt) {
             throw new \RuntimeException("Certificate does not contain an SCT extension");
         }
+        
+        // Use the first intermediate cert as the issuer
+        if (count($intermediatesBytes) === 0) {
+            // If no intermediates in bundle, try to find one in TrustedRoot
+            $issuerCertDer = null;
+            foreach ($trustedRoot->getCertificateAuthorities() as $ca) {
+                if ($ca->hasCertChain() && count($ca->getCertChain()->getCertificates()) > 0) {
+                     $issuerCertDer = $ca->getCertChain()->getCertificates()[0]->getRawBytes();
+                     break;
+                }
+            }
+            if (!$issuerCertDer) {
+                 throw new \RuntimeException("Cannot find issuer certificate to verify SCT");
+            }
+        } else {
+            $issuerCertDer = $intermediatesBytes[0];
+        }
+
+        \Sigstore\SctVerifier::verify($leafCertBytes, $issuerCertDer, $trustedRoot);
 
         // 4. Extract Public Key and Verify Signature
         $publicKey = $x509->getPublicKey();
